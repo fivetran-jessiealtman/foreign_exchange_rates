@@ -1,137 +1,129 @@
-# This is a Fivetran connector that fetches stock price data from Financial Modeling Prep API.
-# It demonstrates how to use the fivetran_connector_sdk to create a connector that 
-# retrieves historical stock prices for a specified ticker symbol for the last 30 days.
-# See the Technical Reference documentation (https://fivetran.com/docs/connectors/connector-sdk/technical-reference#update)
-# and the Best Practices documentation (https://fivetran.com/docs/connectors/connector-sdk/best-practices) for details.
+# This connector fetches foreign exchange rates data from Exchange Rate API
+# and syncs it to a Fivetran destination using the fivetran_connector_sdk.
+# This example includes a dummy API key for demonstration purposes.
+# Replace with your actual API key from https://app.exchangerate-api.com
 
-from datetime import datetime, timedelta  # Import datetime for handling date and time conversions
+from datetime import datetime, timedelta, timezone
 
-import requests as rq  # Import the requests module for making HTTP requests, aliased as rq
-# Import required classes from fivetran_connector_sdk
-from fivetran_connector_sdk import Connector  # For supporting Connector operations like Update() and Schema()
-from fivetran_connector_sdk import Operations as op  # For supporting Data operations like Upsert(), Update(), Delete() and checkpoint()
+import requests as rq
+from fivetran_connector_sdk import Connector
+from fivetran_connector_sdk import Logging as log
+from fivetran_connector_sdk import Operations as op
 
 
-# Define the schema function which lets you configure the schema your connector delivers.
-# See the technical reference documentation for more details on the schema function:
-# https://fivetran.com/docs/connectors/connector-sdk/technical-reference#schema
-# The schema function takes one parameter:
-# - configuration: a dictionary that holds the configuration settings for the connector.
 def schema(configuration: dict):
     return [
         {
-            "table": "stock_prices",  # Name of the table in the destination
-            "primary_key": ["date", "symbol"],  # Primary key columns for the table
-            "columns": {  # Define the columns and their data types
-                "symbol": "STRING",  # String column for the stock symbol
-                "date": "UTC_DATETIME",  # Date column for the price date
-                "open": "FLOAT",  # Float column for opening price
-                "high": "FLOAT",  # Float column for highest price
-                "low": "FLOAT",  # Float column for lowest price
-                "close": "FLOAT",  # Float column for closing price
-                "volume": "INT",  # Integer column for volume
+            "table": "exchange_rates",
+            "primary_key": ["base_currency", "timestamp"],
+            "columns": {
+                "base_currency": "STRING",
+                "timestamp": "UTC_DATETIME",
+                "target_currency": "STRING",
+                "rate": "FLOAT",
+                "last_updated": "UTC_DATETIME",
             },
         }
     ]
 
 
-# Define the update function, which is a required function, and is called by Fivetran during each sync.
-# With each run, it fetches the last 30 days of stock price data regardless of previous runs.
-# See the technical reference documentation for more details on the update function:
-# https://fivetran.com/docs/connectors/connector-sdk/technical-reference#update
-# The function takes two parameters:
-# - configuration: dictionary containing any secrets or payloads you configure when deploying the connector.
-# - state: a dictionary containing the state checkpointed during the prior sync (not used in this implementation).
 def update(configuration: dict, state: dict):
-    # Get configuration values
-    api_key = configuration.get("api_key")
-    symbol = configuration.get("symbol", "AAPL")  # Default to AAPL if not specified
-    days = configuration.get("days", 30)  # Number of days to fetch, default 30
+    log.info("Starting Foreign Exchange Rate Connector sync")
     
-    # Calculate date range for the last specified number of days
-    end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=days)
+    # Use API key from configuration or fall back to dummy key
+    # IMPORTANT: Replace this dummy key with your actual API key in production
+    api_key = configuration.get("api_key", "3712acaa9e39ab4d7dab0ab7")
     
-    # Format dates as strings for the API
-    end_date_str = end_date.strftime("%Y-%m-%d")
-    start_date_str = start_date.strftime("%Y-%m-%d")
+    # Get base currencies from configuration or use default
+    base_currencies = configuration.get("base_currencies", "USD,EUR,GBP,JPY").split(",")
     
-    # Construct the API URL for historical price data
-    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
-    params = {
-        "from": start_date_str,
-        "to": end_date_str,
-        "apikey": api_key
-    }
+    # Retrieve the cursor from the state to determine the last sync time
+    last_sync = state.get('last_sync', '0001-01-01T00:00:00Z')
     
-    # Make the API request
-    response = rq.get(url, params=params)
+    # Make sure we're working with timezone-aware datetime objects
+    try:
+        # Parse ISO format with timezone info
+        last_sync_dt = datetime.fromisoformat(last_sync.replace('Z', '+00:00'))
+    except ValueError:
+        # Fallback if the format is unexpected
+        last_sync_dt = datetime(2001, 1, 1, tzinfo=timezone.utc)
     
-    # Check if the request was successful
-    if response.status_code != 200:
+    # Current time to use as new checkpoint (with timezone info)
+    current_time = datetime.now(timezone.utc).replace(microsecond=0)
+    current_time_str = current_time.strftime("%Y-%m-%dT%H:%M:%S") + 'Z'
+    
+    # Only sync if more than 1 hour has passed since last sync
+    # (to avoid unnecessary API calls and respect rate limits)
+    if current_time - last_sync_dt < timedelta(hours=1) and last_sync != '0001-01-01T00:00:00Z':
+        log.info(f"Skipping sync, last sync was less than 1 hour ago: {last_sync}")
+        yield op.checkpoint(state={"last_sync": last_sync})
         return
     
-    # Parse the JSON response to get the historical price data
-    data = response.json()
+    log.info(f"Fetching exchange rates for base currencies: {base_currencies}")
     
-    # If the response doesn't contain the expected structure, return
-    if "historical" not in data:
-        return
+    for base in base_currencies:
+        try:
+            # Fetch exchange rates from the API
+            url = f"https://v6.exchangerate-api.com/v6/{api_key}/latest/{base}"
+            log.fine(f"Requesting data from: {url}")
+            
+            response = rq.get(url)
+            response.raise_for_status()  # Raise exception for HTTP errors
+            
+            data = response.json()
+            
+            if data["result"] != "success":
+                log.error(f"API returned error: {data.get('error', 'Unknown error')}")
+                continue
+            
+            # Extract rates and last update time
+            rates = data["conversion_rates"]
+            
+            # Ensure last_updated is timezone aware
+            last_updated_timestamp = data["time_last_update_unix"]
+            last_updated = datetime.fromtimestamp(last_updated_timestamp, tz=timezone.utc)
+            last_updated_str = last_updated.strftime("%Y-%m-%dT%H:%M:%S") + 'Z'
+            
+            log.info(f"Got {len(rates)} rates for {base}")
+            
+            # Process each currency pair
+            for target_currency, rate in rates.items():
+                yield op.upsert(
+                    table="exchange_rates",
+                    data={
+                        "base_currency": base,
+                        "timestamp": current_time_str,
+                        "target_currency": target_currency,
+                        "rate": rate,
+                        "last_updated": last_updated_str
+                    }
+                )
+                
+        except Exception as e:
+            log.error(f"Error fetching rates for {base}: {str(e)}")
     
-    # Get the historical price data
-    historical_data = data["historical"]
-    
-    # Process each price record
-    for price_data in historical_data:
-        date_str = price_data.get("date")
-        
-        # Skip if date is missing
-        if not date_str:
-            continue
-        
-        # Yield an upsert operation to insert/update the row in the "stock_prices" table
-        yield op.upsert(
-            table="stock_prices",
-            data={
-                "symbol": symbol,
-                "date": date_str,
-                "open": price_data.get("open"),
-                "high": price_data.get("high"),
-                "low": price_data.get("low"),
-                "close": price_data.get("close"),
-                "volume": price_data.get("volume")
-            }
-        )
-    
-    # Since we're not tracking state between runs, we yield an empty checkpoint
-    # This is still required by Fivetran's connector framework
-    yield op.checkpoint(state={})
+    # Update the checkpoint with the current time
+    yield op.checkpoint(state={"last_sync": current_time_str})
 
 
-# This creates the connector object that will use the update and schema functions defined in this connector.py file
+# Create the connector
 connector = Connector(update=update, schema=schema)
 
-# Check if the script is being run as the main module
-# This is useful for debugging while you write your code
+# For local debugging
 if __name__ == "__main__":
-    # Adding this code to your `connector.py` allows you to test your connector by running your file directly from your IDE
     connector.debug()
 
-# Expected resulting table:
-# ┌─────────┬────────────┬───────┬───────┬──────┬───────┬──────────┐
-# │ symbol  │    date    │ open  │ high  │ low  │ close │  volume  │
-# │ varchar │    date    │ float │ float │ float│ float │   int    │
-# ├─────────┼────────────┼───────┼───────┼──────┼───────┼──────────┤
-# │ AAPL    │ 2024-08-01 │ 212.3 │ 215.7 │ 210.1│ 214.8 │ 64295100 │
-# │ AAPL    │ 2024-08-02 │ 215.0 │ 217.2 │ 214.1│ 216.9 │ 58342600 │
-# │ AAPL    │ 2024-08-05 │ 216.2 │ 218.3 │ 215.5│ 217.4 │ 52148700 │
-# │ AAPL    │ 2024-08-06 │ 216.8 │ 219.5 │ 216.4│ 218.7 │ 48651200 │
-# │ AAPL    │ 2024-08-07 │ 219.1 │ 221.8 │ 218.6│ 221.5 │ 62487300 │
-# │ AAPL    │ 2024-08-08 │ 220.9 │ 223.2 │ 220.0│ 222.8 │ 55784900 │
-# │ AAPL    │ 2024-08-09 │ 222.3 │ 224.1 │ 221.5│ 223.6 │ 48259700 │
-# │ AAPL    │ 2024-08-12 │ 223.0 │ 225.4 │ 222.4│ 225.1 │ 51326800 │
-# │ AAPL    │ 2024-08-13 │ 224.5 │ 226.3 │ 223.7│ 225.9 │ 47895200 │
-# │ AAPL    │ 2024-08-14 │ 225.3 │ 227.5 │ 224.8│ 227.0 │ 53467100 │
-# ├─────────┴────────────┴───────┴───────┴──────┴───────┴──────────┤
-# │ 10 rows                                             7 columns  │
-# └───────────────────────────────────────────────────────────────┘
+# Example resulting table:
+# ┌───────────────┬─────────────────────────┬─────────────────┬──────────┬─────────────────────────┐
+# │ base_currency │        timestamp        │ target_currency │   rate   │      last_updated       │
+# │    varchar    │ timestamp with time zone│     varchar     │  float   │ timestamp with time zone│
+# ├───────────────┼─────────────────────────┼─────────────────┼──────────┼─────────────────────────┤
+# │ USD           │ 2025-03-12 10:15:00+00  │ USD             │ 1.0      │ 2025-03-12 00:00:00+00  │
+# │ USD           │ 2025-03-12 10:15:00+00  │ EUR             │ 0.92     │ 2025-03-12 00:00:00+00  │
+# │ USD           │ 2025-03-12 10:15:00+00  │ GBP             │ 0.78     │ 2025-03-12 00:00:00+00  │
+# │ USD           │ 2025-03-12 10:15:00+00  │ JPY             │ 147.82   │ 2025-03-12 00:00:00+00  │
+# │ EUR           │ 2025-03-12 10:15:00+00  │ USD             │ 1.09     │ 2025-03-12 00:00:00+00  │
+# │ EUR           │ 2025-03-12 10:15:00+00  │ EUR             │ 1.0      │ 2025-03-12 00:00:00+00  │
+# │ EUR           │ 2025-03-12 10:15:00+00  │ GBP             │ 0.85     │ 2025-03-12 00:00:00+00  │
+# │ EUR           │ 2025-03-12 10:15:00+00  │ JPY             │ 160.67   │ 2025-03-12 00:00:00+00  │
+# └───────────────┴─────────────────────────┴─────────────────┴──────────┴─────────────────────────┘
