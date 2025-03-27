@@ -11,6 +11,7 @@ from fivetran_connector_sdk import Logging as log
 from fivetran_connector_sdk import Operations as op
 
 
+
 def schema(configuration: dict):
     return [
         {
